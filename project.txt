@@ -1,0 +1,1295 @@
+=== FILE: build.gradle ===
+plugins {
+    id 'fabric-loom' version '1.14-SNAPSHOT'
+}
+version = project.mod_version
+group = project.maven_group
+base { archivesName = project.archives_base_name }
+
+dependencies {
+    minecraft "com.mojang:minecraft:${project.minecraft_version}"
+    mappings "net.fabricmc:yarn:${project.yarn_mappings}:v2"
+    modImplementation "net.fabricmc:fabric-loader:${project.loader_version}"
+    modImplementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_version}"
+}
+
+processResources {
+    inputs.property "version", project.version
+    filesMatching("fabric.mod.json") { expand "version": project.version }
+}
+
+tasks.withType(JavaCompile).configureEach { it.options.release = 21 }
+java {
+    sourceCompatibility = JavaVersion.VERSION_21
+    targetCompatibility = JavaVersion.VERSION_21
+}
+=== FILE: gradle.properties ===
+org.gradle.jvmargs=-Xmx2G
+# !!! Đối chiếu version với https://fabricmc.net/develop (chọn 1.21.11) trước khi build !!!
+minecraft_version=1.21.11
+yarn_mappings=1.21.11+build.1
+loader_version=0.18.4
+fabric_version=0.139.0+1.21.11
+mod_version=1.0.0
+maven_group=com.example
+archives_base_name=autobuild
+=== FILE: settings.gradle ===
+pluginManagement {
+    repositories {
+        maven { url = 'https://maven.fabricmc.net/' }
+        mavenCentral()
+        gradlePluginPortal()
+    }
+}
+=== FILE: src/main/java/com/example/autobuild/AutoBuildClient.java ===
+package com.example.autobuild;
+
+import net.fabricmc.api.ClientModInitializer;
+import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
+import net.fabricmc.fabric.api.client.keybinding.v1.KeyBindingHelper;
+import net.minecraft.client.option.KeyBinding;
+import net.minecraft.client.util.InputUtil;
+import net.minecraft.util.Identifier;
+import org.lwjgl.glfw.GLFW;
+
+public class AutoBuildClient implements ClientModInitializer {
+    @Override
+    public void onInitializeClient() {
+        KeyBinding.Category cat = KeyBinding.Category.create(Identifier.of("autobuild", "main"));
+        KeyBinding menuKey = KeyBindingHelper.registerKeyBinding(
+            new KeyBinding("key.autobuild.menu", InputUtil.Type.KEYSYM, GLFW.GLFW_KEY_B, cat));
+        KeyBinding toggleKey = KeyBindingHelper.registerKeyBinding(
+            new KeyBinding("key.autobuild.toggle", InputUtil.Type.KEYSYM, GLFW.GLFW_KEY_N, cat));
+
+        ClientTickEvents.START_CLIENT_TICK.register(client -> {
+            while (menuKey.wasPressed()) client.setScreen(new MenuScreen());
+            while (toggleKey.wasPressed()) {
+                if (BuildEngine.isRunning()) BuildEngine.stop("Đã dừng.");
+                else BuildEngine.start();
+            }
+            BuildEngine.tick();
+        });
+    }
+}
+=== FILE: src/main/java/com/example/autobuild/BuildEngine.java ===
+package com.example.autobuild;
+
+import com.example.autobuild.Schematic.Entry;
+import com.example.autobuild.pathing.Navigator;
+import net.fabricmc.loader.api.FabricLoader;
+import net.minecraft.block.Block;
+import net.minecraft.block.BlockState;
+import net.minecraft.block.SlabBlock;
+import net.minecraft.block.enums.SlabType;
+import net.minecraft.item.ItemPlacementContext;
+import net.minecraft.block.ShapeContext;
+import net.minecraft.client.MinecraftClient;
+import net.minecraft.item.BlockItem;
+import net.minecraft.item.Item;
+import net.minecraft.item.ItemStack;
+import net.minecraft.network.packet.c2s.play.PlayerMoveC2SPacket;
+import net.minecraft.registry.Registries;
+import net.minecraft.screen.slot.SlotActionType;
+import net.minecraft.state.property.Property;
+import net.minecraft.text.Text;
+import net.minecraft.util.ActionResult;
+import net.minecraft.util.Hand;
+import net.minecraft.util.Identifier;
+import net.minecraft.util.hit.BlockHitResult;
+import net.minecraft.util.math.BlockPos;
+import net.minecraft.util.math.Direction;
+import net.minecraft.util.math.Vec3d;
+
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.*;
+import java.util.function.Predicate;
+
+public final class BuildEngine {
+    private static final MinecraftClient mc = MinecraftClient.getInstance();
+    private static boolean hopping = false;
+    private static final Set<BlockPos> accepted = new HashSet<>();
+    private static final Map<BlockPos, Integer> breakCount = new HashMap<>();
+
+    private static final Navigator nav = new Navigator();
+    private static TreeMap<Integer, List<Entry>> layers = new TreeMap<>();
+    private static final Set<BlockPos> unreachable = new HashSet<>();
+    private static BlockPos breaking, navTarget;
+    private static int timer, stall, climbTicks, lastLayerY = Integer.MIN_VALUE;
+    private static boolean running, warnedDrop, pillar;
+
+    public static boolean isRunning() { return running; }
+
+    private static void chat(String msg) {
+        if (mc.player != null) mc.player.sendMessage(Text.literal("[AutoBuild] " + msg), false);
+    }
+
+    // ================= bắt đầu / dừng =================
+    private static Path resolveFile(Path dir, String name) {
+        if (name.endsWith(".nbt") || name.endsWith(".litematic")) return dir.resolve(name).normalize();
+        Path nbt = dir.resolve(name + ".nbt").normalize();
+        return Files.exists(nbt) ? nbt : dir.resolve(name + ".litematic").normalize();
+    }
+
+    public static void start() {
+        if (mc.player == null || mc.world == null) return;
+        Config c = Config.get();
+        timer = stall = climbTicks = 0;
+        breaking = null; navTarget = null; pillar = false; warnedDrop = false;
+        lastLayerY = Integer.MIN_VALUE;
+        unreachable.clear();
+        accepted.clear();
+        breakCount.clear();
+        nav.stop();
+
+        TreeMap<Integer, List<Entry>> loaded = null;
+        String source = "";
+
+        // 1) Schematic đang load/đặt trong Litematica
+        if (c.useLitematica) {
+            try {
+                loaded = Schematic.loadFromLitematica(mc.player.getBlockPos(), c.scanRadius, c.scanBelow, c.scanAbove);
+                if (loaded != null && loaded.isEmpty()) {
+                    chat("Litematica chưa có block nào quanh bạn (chưa load/đặt schematic, hoặc bạn đứng quá xa nó).");
+                    loaded = null;
+                } else if (loaded != null) {
+                    source = "Litematica";
+                } else {
+                    chat("Litematica chưa có schematic nào được load.");
+                }
+            } catch (ClassNotFoundException e) {
+                chat("Không thấy Litematica trong game, chuyển sang đọc file.");
+            } catch (Throwable e) {
+                chat("Không đọc được từ Litematica: " + e);
+            }
+        }
+
+        // 2) Không có thì đọc file trong thư mục autobuild/
+        if (loaded == null) {
+            try {
+                Path dir = FabricLoader.getInstance().getGameDir().resolve("autobuild");
+                Files.createDirectories(dir);
+                Path file = resolveFile(dir, c.schematic);
+                if (!file.startsWith(dir) || !Files.exists(file)) {
+                    chat("Cũng không thấy file '" + c.schematic + "' (.nbt/.litematic) trong: " + dir);
+                    return;
+                }
+                loaded = Schematic.load(file, mc.player.getBlockPos());
+                source = "file " + file.getFileName();
+            } catch (Exception e) {
+                chat("Lỗi đọc file: " + e.getMessage());
+                return;
+            }
+        }
+
+        layers = loaded;
+        int n = layers.values().stream().mapToInt(List::size).sum();
+        if (n == 0) { chat("Không có block nào để xây."); return; }
+        chat("Đã nạp " + n + " block, " + layers.size() + " tầng từ " + source + ". Bắt đầu xây.");
+        running = true;
+    }
+
+    public static void stop(String msg) {
+        running = false;
+        if (hopping) { mc.options.jumpKey.setPressed(false); hopping = false; }
+        breaking = null; navTarget = null;
+        nav.stop();
+        releasePillarKeys();
+        if (msg != null) chat(msg);
+    }
+
+    private static void releasePillarKeys() {
+        if (pillar && mc.options != null) mc.options.jumpKey.setPressed(false);
+        pillar = false;
+    }
+
+    // ================= so khớp =================
+    /** Thuộc tính liên quan tới hướng đặt (bỏ qua redstone, shape cầu thang, waterlogged...). */
+    private static boolean isOrientProp(Property<?> p, BlockState st) {
+        String n = p.getName();
+        if (n.equals("facing") || n.equals("axis") || n.equals("half")) return true;
+        return n.equals("type") && st.getBlock() instanceof SlabBlock && st.get(p) != SlabType.DOUBLE;
+    }
+
+    private static boolean needsOrientation(BlockState want) {
+        for (Property<?> p : want.getProperties()) if (isOrientProp(p, want)) return true;
+        return false;
+    }
+
+    private static boolean orientMatches(BlockState got, BlockState want) {
+        for (Property<?> p : want.getProperties()) {
+            if (!isOrientProp(p, want)) continue;
+            if (!got.contains(p) || !got.get(p).equals(want.get(p))) return false;
+        }
+        return true;
+    }
+
+    private static boolean matches(BlockState actual, BlockState target) {
+        if (actual.getBlock() != target.getBlock()) return false;
+        if (!Config.get().orient) return true;
+        return orientMatches(actual, target);
+    }
+
+    private static boolean inReach(BlockPos pos) {
+        double r = Config.get().range;
+        return mc.player.getEyePos().squaredDistanceTo(Vec3d.ofCenter(pos)) <= r * r;
+    }
+
+    private static boolean hasSupport(BlockPos p) {
+        for (Direction d : Direction.values()) {
+            BlockState s = mc.world.getBlockState(p.offset(d));
+            if (!s.isReplaceable() && s.getFluidState().isEmpty()) return true;
+        }
+        return false;
+    }
+
+    // ================= tick =================
+    public static void tick() {
+        if (!running) return;
+        if (mc.player == null || mc.world == null || mc.interactionManager == null) { stop(null); return; }
+        Config cfg = Config.get();
+        nav.turnSpeed = cfg.turnSpeed;
+        nav.sprint = cfg.sprint;
+        nav.maxNodes = cfg.maxNodes;
+        if (hopping) { mc.options.jumpKey.setPressed(false); hopping = false; }
+
+        // tầng hiện tại = tầng thấp nhất còn block chưa đúng
+        List<Entry> pending = null;
+        int layerY = 0;
+        for (Map.Entry<Integer, List<Entry>> me : layers.entrySet()) {
+            List<Entry> p = new ArrayList<>();
+            for (Entry en : me.getValue()) {
+                if (accepted.contains(en.pos())) continue;
+                if (!matches(mc.world.getBlockState(en.pos()), en.state())) p.add(en);
+            }
+            if (!p.isEmpty()) { pending = p; layerY = me.getKey(); break; }
+        }
+        if (pending == null) { stop("Xây xong!"); return; }
+        if (layerY != lastLayerY) {
+            if (lastLayerY != Integer.MIN_VALUE) chat("Chuyển sang tầng Y=" + layerY);
+            lastLayerY = layerY;
+            unreachable.clear();
+            stall = 0;
+        }
+
+        // đang đập block sai
+        if (breaking != null) {
+            BlockState s = mc.world.getBlockState(breaking);
+            if (s.isReplaceable() || !inReach(breaking)) {
+                breaking = null;
+            } else {
+                nav.stop();
+                selectBreakTool(s);
+                mc.interactionManager.updateBlockBreakingProgress(breaking, Direction.UP);
+                mc.player.swingHand(Hand.MAIN_HAND);
+                return;
+            }
+        }
+
+        Vec3d eye = mc.player.getEyePos();
+        Comparator<Entry> byDist = Comparator.comparingDouble(e -> eye.squaredDistanceTo(Vec3d.ofCenter(e.pos())));
+        List<Entry> reachable = new ArrayList<>();
+        for (Entry en : pending) if (inReach(en.pos())) reachable.add(en);
+        reachable.sort(byDist);
+
+        if (reachable.isEmpty()) { moveToWork(pending, byDist, layerY); return; }
+
+        // đã tới tầm với
+        if (nav.state() != Navigator.State.IDLE) nav.stop();
+        releasePillarKeys();
+        navTarget = null;
+        climbTicks = 0;
+
+        if (timer > 0) { timer--; return; }
+
+        for (Entry en : reachable) {
+            if (!mc.world.getBlockState(en.pos()).isReplaceable()) {
+                if (cfg.breakWrong) {
+                    if (breakCount.merge(en.pos(), 1, Integer::sum) > 2) { accepted.add(en.pos()); continue; }
+                    breaking = en.pos(); stall = 0; return;
+                }
+                continue;
+            }
+            if (!hasSupport(en.pos())) continue; // hoãn tới khi có block bên cạnh
+            // ô cần đặt đang nằm trong người mình (thảm, nút, block dưới chân...): nhảy lên rồi đặt
+            if (mc.player.getBoundingBox().intersects(new net.minecraft.util.math.Box(en.pos()))) {
+                if (mc.player.isOnGround()) { mc.options.jumpKey.setPressed(true); hopping = true; }
+                return;
+            }
+            Item item = en.state().getBlock().asItem();
+            Predicate<ItemStack> pred = s -> s.getItem() == item;
+            int hot = findHotbar(pred);
+            if (hot < 0) {
+                int inv = findInventory(pred);
+                if (inv < 0) { stop("Hết block: " + item.getName().getString()); return; }
+                moveToHotbar(inv, cfg.spareSlot - 1);
+                timer = 2;
+                return;
+            }
+            if (place(en.pos(), hot, en.state())) { stall = 0; timer = cfg.delay; return; }
+        }
+
+        if (++stall > cfg.stallLimit) {
+            stop("Kẹt ở tầng Y=" + layerY + ": còn " + pending.size() + " block không đặt được (thiếu chỗ tựa / bị chặn).");
+        }
+    }
+
+    // ================= di chuyển: A* rồi leo =================
+    private static void moveToWork(List<Entry> pending, Comparator<Entry> byDist, int layerY) {
+        Config cfg = Config.get();
+
+        if (pillar) { climb(); return; }
+
+        Entry target = null;
+        if (navTarget != null && nav.state() == Navigator.State.MOVING) {
+            for (Entry e : pending) if (e.pos().equals(navTarget)) { target = e; break; }
+        }
+        if (target == null) {
+            List<Entry> cand = new ArrayList<>();
+            for (Entry e : pending) if (!unreachable.contains(e.pos())) cand.add(e);
+            if (cand.isEmpty()) { stop("Không có đường tới các block còn lại ở tầng Y=" + layerY + ", dừng."); return; }
+            target = Collections.min(cand, byDist);
+        }
+
+        if (navTarget == null || !navTarget.equals(target.pos()) || nav.state() == Navigator.State.IDLE) {
+            startWalking(target.pos());
+        }
+
+        Navigator.State st = nav.tick();
+        if (st == Navigator.State.FAILED) {
+            nav.stop();
+            navTarget = null;
+            boolean above = target.pos().getY() + 0.5 > mc.player.getEyeY() + 1.0;
+            if (above && cfg.climb) {
+                pillar = true;
+                climbTicks = 0;
+                chat("Không có đường đi bộ lên, thử bắc block để leo.");
+            } else {
+                unreachable.add(target.pos());
+            }
+        } else if (st == Navigator.State.ARRIVED) {
+            nav.stop();
+            navTarget = null;
+        }
+    }
+
+    private static void startWalking(BlockPos target) {
+        navTarget = target;
+        double reachD = Config.get().range - 0.35;
+        double r2 = reachD * reachD;
+        nav.goTo(
+            n -> Navigator.eyeDistanceSq(n, target) <= r2 && !(n.x() == target.getX() && n.z() == target.getZ()
+                && (n.y() == target.getY() || n.y() + 1 == target.getY())),
+            n -> Math.max(0.0, Math.sqrt(Navigator.eyeDistanceSq(n, target)) - reachD)
+        );
+    }
+
+    private static void climb() {
+        Config cfg = Config.get();
+        if (++climbTicks > 400) { stop("Không có đường lên, dừng."); return; }
+
+        BlockPos head = mc.player.getBlockPos().up(2);
+        if (!mc.world.getBlockState(head).getCollisionShape(mc.world, head).isEmpty()) {
+            stop("Không có đường lên (bị chặn trên đầu), dừng.");
+            return;
+        }
+
+        Identifier id = Identifier.tryParse(cfg.scaffold);
+        Item sc = id == null ? null : Registries.ITEM.get(id);
+        if (sc == null) { stop("Block bắc không hợp lệ: " + cfg.scaffold); return; }
+        Predicate<ItemStack> pred = s -> s.getItem() == sc;
+        int hot = findHotbar(pred);
+        if (hot < 0) {
+            int inv = findInventory(pred);
+            if (inv < 0) { stop("Hết block bắc (" + sc.getName().getString() + "), dừng."); return; }
+            moveToHotbar(inv, cfg.spareSlot - 1);
+            return;
+        }
+
+        if (mc.player.isOnGround()) {
+            mc.options.jumpKey.setPressed(true);
+        } else {
+            BlockPos below = mc.player.getBlockPos().down();
+            if (mc.world.getBlockState(below).isReplaceable()) place(below, hot, null);
+        }
+    }
+
+    // ================= đặt block =================
+    private static boolean place(BlockPos pos, int hotbarSlot, BlockState want) {
+        ItemStack held = mc.player.getInventory().getStack(hotbarSlot);
+        if (!(held.getItem() instanceof BlockItem bi)) return false;
+        Block block = bi.getBlock();
+        BlockState st = block.getDefaultState();
+        if (!mc.world.canPlace(st, pos, ShapeContext.absent())) return false;
+        double r = Config.get().range;
+        boolean needDir = Config.get().orient && want != null && needsOrientation(want);
+
+        float[] ang = null;          // góc nhìn tìm được để ra đúng hướng
+        BlockHitResult hitRes = null;
+        BlockHitResult fallback = null;
+
+        outer:
+        for (Direction d : Direction.values()) {
+            BlockPos nb = pos.offset(d);
+            if (mc.world.getBlockState(nb).isReplaceable()) continue;
+            Direction face = d.getOpposite();
+            double[] ys = face.getAxis().isHorizontal() ? new double[]{0.0, -0.25, 0.25} : new double[]{0.0};
+            for (double dy : ys) {
+                Vec3d hit = Vec3d.ofCenter(nb).add(face.getOffsetX() * 0.5, face.getOffsetY() * 0.5 + dy, face.getOffsetZ() * 0.5);
+                if (mc.player.getEyePos().squaredDistanceTo(hit) > r * r) continue;
+                BlockHitResult hr = new BlockHitResult(hit, face, nb, false);
+                if (fallback == null) fallback = hr;
+                if (!needDir) { hitRes = hr; break outer; }
+
+                float oy = mc.player.getYaw(), op = mc.player.getPitch();
+                try {
+                    for (float yaw : new float[]{0f, 90f, 180f, 270f}) {
+                        for (float pitch : new float[]{0f, -80f, 80f}) {
+                            mc.player.setYaw(yaw);
+                            mc.player.setPitch(pitch);
+                            BlockState got = block.getPlacementState(new ItemPlacementContext(mc.player, Hand.MAIN_HAND, held, hr));
+                            if (got != null && orientMatches(got, want)) {
+                                ang = new float[]{yaw, pitch};
+                                hitRes = hr;
+                                break outer;
+                            }
+                        }
+                    }
+                } finally {
+                    mc.player.setYaw(oy);
+                    mc.player.setPitch(op);
+                }
+            }
+        }
+
+        if (hitRes == null) hitRes = fallback;      // không tìm được hướng đúng -> đặt kiểu thường
+        if (hitRes == null) return false;
+
+        if (ang != null) lookAngles(ang[0], ang[1]); else lookAt(hitRes.getPos());
+        mc.player.getInventory().setSelectedSlot(hotbarSlot);
+        // ngồi (sneak) để bấm vào rương/bàn/cửa... không mở GUI mà đặt block
+        boolean wasSneak = mc.player.isSneaking();
+        if (!wasSneak) {
+            mc.getNetworkHandler().sendPacket(new net.minecraft.network.packet.c2s.play.PlayerInputC2SPacket(
+                new net.minecraft.util.PlayerInput(false, false, false, false, false, true, false)));
+            mc.player.setSneaking(true);
+        }
+        ActionResult res = mc.interactionManager.interactBlock(mc.player, Hand.MAIN_HAND, hitRes);
+        if (!wasSneak) {
+            mc.player.setSneaking(false);
+            mc.getNetworkHandler().sendPacket(new net.minecraft.network.packet.c2s.play.PlayerInputC2SPacket(
+                new net.minecraft.util.PlayerInput(false, false, false, false, false, false, false)));
+        }
+        if (res.isAccepted()) {
+            mc.player.swingHand(Hand.MAIN_HAND);
+            return true;
+        }
+        return false;
+    }
+
+    private static void lookAngles(float yaw, float pitch) {
+        mc.player.setYaw(yaw);
+        mc.player.setPitch(pitch);
+        mc.getNetworkHandler().sendPacket(new PlayerMoveC2SPacket.LookAndOnGround(
+            yaw, pitch, mc.player.isOnGround(), mc.player.horizontalCollision));
+    }
+
+    private static void lookAt(Vec3d t) {
+        Vec3d eye = mc.player.getEyePos();
+        double dx = t.x - eye.x, dy = t.y - eye.y, dz = t.z - eye.z;
+        float yaw = (float) (Math.toDegrees(Math.atan2(dz, dx)) - 90.0);
+        float pitch = (float) -Math.toDegrees(Math.atan2(dy, Math.sqrt(dx * dx + dz * dz)));
+        lookAngles(yaw, pitch);
+    }
+
+    // ================= công cụ đập =================
+    private static void selectBreakTool(BlockState s) {
+        Config.ToolMode mode = Config.get().toolMode;
+        boolean wantNoDrop = mode == Config.ToolMode.Hand || (mode == Config.ToolMode.NoDrop && s.isToolRequired());
+
+        if (mode == Config.ToolMode.NoDrop && !s.isToolRequired() && !warnedDrop) {
+            warnedDrop = true;
+            chat("Có block không cần công cụ (đất, gỗ...) - game vẫn cho rơi đồ dù dùng tay.");
+        }
+
+        if (wantNoDrop) {
+            int slot = -1;
+            for (int i = 0; i < 9; i++) {
+                ItemStack st = mc.player.getInventory().getStack(i);
+                if (st.isEmpty()) { slot = i; break; }
+                if (slot == -1 && !st.isSuitableFor(s)) slot = i;
+            }
+            if (slot != -1) { mc.player.getInventory().setSelectedSlot(slot); return; }
+        }
+        int best = -1;
+        float bestSpeed = 1.0f;
+        for (int i = 0; i < 9; i++) {
+            float sp = mc.player.getInventory().getStack(i).getMiningSpeedMultiplier(s);
+            if (sp > bestSpeed) { bestSpeed = sp; best = i; }
+        }
+        if (best != -1) mc.player.getInventory().setSelectedSlot(best);
+    }
+
+    // ================= túi đồ =================
+    private static int findHotbar(Predicate<ItemStack> p) {
+        for (int i = 0; i < 9; i++) if (p.test(mc.player.getInventory().getStack(i))) return i;
+        return -1;
+    }
+
+    private static int findInventory(Predicate<ItemStack> p) {
+        for (int i = 9; i < 36; i++) if (p.test(mc.player.getInventory().getStack(i))) return i;
+        return -1;
+    }
+
+    private static void moveToHotbar(int invIndex, int hotbarIndex) {
+        mc.interactionManager.clickSlot(mc.player.playerScreenHandler.syncId, invIndex, hotbarIndex, SlotActionType.SWAP, mc.player);
+    }
+}
+=== FILE: src/main/java/com/example/autobuild/Config.java ===
+package com.example.autobuild;
+
+import com.google.gson.Gson;
+import com.google.gson.GsonBuilder;
+import net.fabricmc.loader.api.FabricLoader;
+
+import java.nio.file.Files;
+import java.nio.file.Path;
+
+public final class Config {
+    public enum ToolMode { NoDrop, Hand, Best }
+
+    public String schematic = "build";
+    public double range = 4.5;
+    public int delay = 1;
+    public boolean breakWrong = true;
+    public ToolMode toolMode = ToolMode.NoDrop;
+    public boolean orient = true;
+    public boolean climb = true;
+    public String scaffold = "minecraft:cobblestone";
+    public int spareSlot = 9;
+    public int stallLimit = 200;
+    public int turnSpeed = 35;
+    public boolean sprint = true;
+    public int maxNodes = 6000;
+    public boolean useLitematica = true;
+    public int scanRadius = 40;
+    public int scanBelow = 8;
+    public int scanAbove = 70;
+
+    private static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
+    private static Config instance;
+
+    private static Path file() {
+        return FabricLoader.getInstance().getConfigDir().resolve("autobuild.json");
+    }
+
+    public static Config get() {
+        if (instance == null) {
+            try {
+                if (Files.exists(file())) instance = GSON.fromJson(Files.readString(file()), Config.class);
+            } catch (Exception ignored) {}
+            if (instance == null) instance = new Config();
+        }
+        return instance;
+    }
+
+    public static void save() {
+        try {
+            Files.writeString(file(), GSON.toJson(get()));
+        } catch (Exception ignored) {}
+    }
+}
+=== FILE: src/main/java/com/example/autobuild/MenuScreen.java ===
+package com.example.autobuild;
+
+import net.minecraft.client.gui.DrawContext;
+import net.minecraft.client.gui.screen.Screen;
+import net.minecraft.client.gui.widget.ButtonWidget;
+import net.minecraft.client.gui.widget.TextFieldWidget;
+import net.minecraft.text.Text;
+
+public class MenuScreen extends Screen {
+    private static final double[] RANGES = {3.0, 3.5, 4.0, 4.5, 5.0, 5.5, 6.0};
+    private TextFieldWidget nameField, scaffoldField;
+
+    public MenuScreen() {
+        super(Text.literal("Auto Build"));
+    }
+
+    private static String onOff(boolean b) { return b ? "BẬT" : "TẮT"; }
+
+    private static String src(boolean lit) { return "Nguồn: " + (lit ? "Litematica (ưu tiên)" : "File trong autobuild/"); }
+
+    @Override
+    protected void init() {
+        Config c = Config.get();
+        int cx = width / 2, w = 200, h = 20, x = cx - w / 2;
+        int y = Math.max(30, height / 2 - 120);
+
+        nameField = new TextFieldWidget(textRenderer, x, y, w, h, Text.literal("Tên file"));
+        nameField.setMaxLength(64);
+        nameField.setText(c.schematic);
+        nameField.setPlaceholder(Text.literal("Tên file .nbt hoặc .litematic (thư mục autobuild/)"));
+        addDrawableChild(nameField);
+        y += 22;
+
+        scaffoldField = new TextFieldWidget(textRenderer, x, y, w, h, Text.literal("Block bắc"));
+        scaffoldField.setMaxLength(64);
+        scaffoldField.setText(c.scaffold);
+        scaffoldField.setPlaceholder(Text.literal("Block bắc, vd minecraft:cobblestone"));
+        addDrawableChild(scaffoldField);
+        y += 22;
+
+        addDrawableChild(ButtonWidget.builder(Text.literal(src(c.useLitematica)), b -> {
+            c.useLitematica = !c.useLitematica;
+            b.setMessage(Text.literal(src(c.useLitematica)));
+        }).dimensions(x, y, w, h).build());
+        y += 22;
+
+        addDrawableChild(ButtonWidget.builder(Text.literal("Đập block sai: " + onOff(c.breakWrong)), b -> {
+            c.breakWrong = !c.breakWrong;
+            b.setMessage(Text.literal("Đập block sai: " + onOff(c.breakWrong)));
+        }).dimensions(x, y, w, h).build());
+        y += 22;
+
+        addDrawableChild(ButtonWidget.builder(Text.literal("Công cụ đập: " + c.toolMode), b -> {
+            Config.ToolMode[] v = Config.ToolMode.values();
+            c.toolMode = v[(c.toolMode.ordinal() + 1) % v.length];
+            b.setMessage(Text.literal("Công cụ đập: " + c.toolMode));
+        }).dimensions(x, y, w, h).build());
+        y += 22;
+
+        addDrawableChild(ButtonWidget.builder(Text.literal("Đặt đúng hướng block: " + onOff(c.orient)), b -> {
+            c.orient = !c.orient;
+            b.setMessage(Text.literal("Đặt đúng hướng block: " + onOff(c.orient)));
+        }).dimensions(x, y, w, h).build());
+        y += 22;
+
+        addDrawableChild(ButtonWidget.builder(Text.literal("Leo khi rơi: " + onOff(c.climb)), b -> {
+            c.climb = !c.climb;
+            b.setMessage(Text.literal("Leo khi rơi: " + onOff(c.climb)));
+        }).dimensions(x, y, w, h).build());
+        y += 22;
+
+        addDrawableChild(ButtonWidget.builder(Text.literal("Tầm với: " + c.range), b -> {
+            int i = 0;
+            for (int k = 0; k < RANGES.length; k++) if (RANGES[k] == c.range) i = k;
+            c.range = RANGES[(i + 1) % RANGES.length];
+            b.setMessage(Text.literal("Tầm với: " + c.range));
+        }).dimensions(x, y, w, h).build());
+        y += 22;
+
+        addDrawableChild(ButtonWidget.builder(Text.literal("Độ trễ (tick): " + c.delay), b -> {
+            c.delay = (c.delay + 1) % 6;
+            b.setMessage(Text.literal("Độ trễ (tick): " + c.delay));
+        }).dimensions(x, y, w, h).build());
+        y += 28;
+
+        addDrawableChild(ButtonWidget.builder(Text.literal(BuildEngine.isRunning() ? "DỪNG" : "BẮT ĐẦU XÂY"), b -> {
+            applyFields();
+            Config.save();
+            if (BuildEngine.isRunning()) BuildEngine.stop("Đã dừng.");
+            else BuildEngine.start();
+            close();
+        }).dimensions(x, y, w, h).build());
+    }
+
+    private void applyFields() {
+        Config c = Config.get();
+        String n = nameField.getText().trim();
+        if (!n.isEmpty()) c.schematic = n;
+        String s = scaffoldField.getText().trim();
+        if (!s.isEmpty()) c.scaffold = s;
+    }
+
+    @Override
+    public void render(DrawContext ctx, int mouseX, int mouseY, float delta) {
+        super.render(ctx, mouseX, mouseY, delta);
+        ctx.drawCenteredTextWithShadow(textRenderer, title, width / 2, 12, 0xFFFFFF);
+    }
+
+    @Override
+    public void removed() {
+        applyFields();
+        Config.save();
+    }
+}
+=== FILE: src/main/java/com/example/autobuild/Schematic.java ===
+package com.example.autobuild;
+
+import net.minecraft.block.BlockState;
+import net.minecraft.block.Blocks;
+import net.minecraft.block.enums.BedPart;
+import net.minecraft.block.enums.DoubleBlockHalf;
+import net.minecraft.item.Items;
+import net.minecraft.nbt.NbtCompound;
+import net.minecraft.nbt.NbtIo;
+import net.minecraft.nbt.NbtList;
+import net.minecraft.nbt.NbtSizeTracker;
+import net.minecraft.registry.Registries;
+import net.minecraft.state.property.Properties;
+import net.minecraft.state.property.Property;
+import net.minecraft.util.Identifier;
+import net.minecraft.util.math.BlockPos;
+import net.minecraft.world.World;
+
+import java.io.IOException;
+import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.TreeMap;
+
+/** Đọc file structure .nbt (vanilla) thành danh sách block theo từng tầng Y. */
+public final class Schematic {
+    public record Entry(BlockPos pos, BlockState state) {}
+
+    public static TreeMap<Integer, List<Entry>> load(Path file, BlockPos origin) throws IOException {
+        if (file.getFileName().toString().endsWith(".litematic")) return loadLitematic(file, origin);
+        NbtCompound root = NbtIo.readCompressed(file, NbtSizeTracker.ofUnlimitedBytes());
+
+        NbtList paletteNbt = root.getListOrEmpty("palette");
+        List<BlockState> palette = new ArrayList<>();
+        for (int i = 0; i < paletteNbt.size(); i++) palette.add(parseState(paletteNbt.getCompoundOrEmpty(i)));
+
+        TreeMap<Integer, List<Entry>> layers = new TreeMap<>();
+        NbtList blocks = root.getListOrEmpty("blocks");
+        for (int i = 0; i < blocks.size(); i++) {
+            NbtCompound b = blocks.getCompoundOrEmpty(i);
+            NbtList p = b.getListOrEmpty("pos");
+            int idx = b.getInt("state", 0);
+            if (idx < 0 || idx >= palette.size()) continue;
+            BlockState st = palette.get(idx);
+            if (skip(st)) continue;
+            BlockPos pos = origin.add(p.getInt(0, 0), p.getInt(1, 0), p.getInt(2, 0));
+            layers.computeIfAbsent(pos.getY(), k -> new ArrayList<>()).add(new Entry(pos, st));
+        }
+        return layers;
+    }
+
+    /**
+     * Lấy block từ schematic đang được load/đặt trong Litematica (không cần file).
+     * Litematica có một "thế giới schematic" chứa block đúng ở toạ độ thật, nên chỉ cần quét quanh người chơi.
+     * Dùng reflection nên mod vẫn chạy bình thường khi không cài Litematica (ném ClassNotFoundException).
+     * @return null nếu Litematica chưa có schematic world
+     */
+    public static TreeMap<Integer, List<Entry>> loadFromLitematica(BlockPos c, int radius, int below, int above) throws Exception {
+        Class<?> handler = Class.forName("fi.dy.masa.litematica.world.SchematicWorldHandler");
+        Object o = handler.getMethod("getSchematicWorld").invoke(null);
+        if (!(o instanceof World sw)) return null;
+
+        int minY = Math.max(sw.getBottomY(), c.getY() - below);
+        int maxY = Math.min(sw.getBottomY() + sw.getHeight() - 1, c.getY() + above);
+        BlockPos.Mutable m = new BlockPos.Mutable();
+        TreeMap<Integer, List<Entry>> layers = new TreeMap<>();
+        for (int y = minY; y <= maxY; y++) {
+            for (int x = c.getX() - radius; x <= c.getX() + radius; x++) {
+                for (int z = c.getZ() - radius; z <= c.getZ() + radius; z++) {
+                    BlockState st = sw.getBlockState(m.set(x, y, z));
+                    if (skip(st)) continue;
+                    layers.computeIfAbsent(y, k -> new ArrayList<>()).add(new Entry(m.toImmutable(), st));
+                }
+            }
+        }
+        return layers;
+    }
+
+    /** Đọc .litematic (Litematica): nhiều region, palette + mảng bit đóng gói. */
+    private static TreeMap<Integer, List<Entry>> loadLitematic(Path file, BlockPos origin) throws IOException {
+        NbtCompound regions = NbtIo.readCompressed(file, NbtSizeTracker.ofUnlimitedBytes()).getCompoundOrEmpty("Regions");
+        TreeMap<Integer, List<Entry>> layers = new TreeMap<>();
+
+        for (String name : regions.getKeys()) {
+            NbtCompound region = regions.getCompoundOrEmpty(name);
+            NbtCompound pos = region.getCompoundOrEmpty("Position");
+            NbtCompound size = region.getCompoundOrEmpty("Size");
+            int sx = size.getInt("x", 0), sy = size.getInt("y", 0), sz = size.getInt("z", 0);
+            // kích thước âm: region kéo dài về phía âm từ Position
+            int ox = pos.getInt("x", 0) + (sx < 0 ? sx + 1 : 0);
+            int oy = pos.getInt("y", 0) + (sy < 0 ? sy + 1 : 0);
+            int oz = pos.getInt("z", 0) + (sz < 0 ? sz + 1 : 0);
+            int ax = Math.abs(sx), ay = Math.abs(sy), az = Math.abs(sz);
+
+            NbtList paletteNbt = region.getListOrEmpty("BlockStatePalette");
+            if (paletteNbt.isEmpty()) continue;
+            BlockState[] palette = new BlockState[paletteNbt.size()];
+            for (int i = 0; i < palette.length; i++) palette[i] = parseState(paletteNbt.getCompoundOrEmpty(i));
+
+            long[] data = region.getLongArray("BlockStates").orElse(new long[0]);
+            int bits = Math.max(2, 32 - Integer.numberOfLeadingZeros(palette.length - 1));
+
+            for (int y = 0; y < ay; y++) for (int z = 0; z < az; z++) for (int x = 0; x < ax; x++) {
+                int id = readPacked(data, x + z * ax + y * ax * az, bits);
+                if (id < 0 || id >= palette.length) continue;
+                BlockState st = palette[id];
+                if (skip(st)) continue;
+                BlockPos bp = origin.add(ox + x, oy + y, oz + z);
+                layers.computeIfAbsent(bp.getY(), k -> new ArrayList<>()).add(new Entry(bp, st));
+            }
+        }
+        return layers;
+    }
+
+    private static int readPacked(long[] data, int index, int bits) {
+        long start = (long) index * bits;
+        int lo = (int) (start >> 6);
+        int hi = (int) ((start + bits - 1L) >> 6);
+        int off = (int) (start & 63L);
+        long mask = (1L << bits) - 1L;
+        if (hi >= data.length) return -1;
+        return lo == hi
+            ? (int) ((data[lo] >>> off) & mask)
+            : (int) (((data[lo] >>> off) | (data[hi] << (64 - off))) & mask);
+    }
+
+    private static boolean skip(BlockState s) {
+        if (s.isAir() || s.isOf(Blocks.STRUCTURE_VOID)) return true;
+        if (s.getBlock().asItem() == Items.AIR) return true;
+        if (s.contains(Properties.DOUBLE_BLOCK_HALF) && s.get(Properties.DOUBLE_BLOCK_HALF) == DoubleBlockHalf.UPPER) return true;
+        if (s.contains(Properties.BED_PART) && s.get(Properties.BED_PART) == BedPart.HEAD) return true;
+        return false;
+    }
+
+    private static BlockState parseState(NbtCompound tag) {
+        Identifier id = Identifier.tryParse(tag.getString("Name", "minecraft:air"));
+        if (id == null || !Registries.BLOCK.containsId(id)) return Blocks.AIR.getDefaultState();
+        BlockState state = Registries.BLOCK.get(id).getDefaultState();
+        NbtCompound props = tag.getCompoundOrEmpty("Properties");
+        for (String key : props.getKeys()) {
+            Property<?> prop = state.getBlock().getStateManager().getProperty(key);
+            if (prop != null) state = apply(state, prop, props.getString(key, ""));
+        }
+        return state;
+    }
+
+    private static <T extends Comparable<T>> BlockState apply(BlockState s, Property<T> p, String v) {
+        return p.parse(v).map(x -> s.with(p, x)).orElse(s);
+    }
+}
+=== FILE: src/main/java/com/example/autobuild/pathing/AStar.java ===
+package com.example.autobuild.pathing;
+
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.List;
+import java.util.PriorityQueue;
+import java.util.function.Predicate;
+import java.util.function.ToDoubleFunction;
+
+/**
+ * Self-written A* over walkable block cells (the position of the player's feet).
+ * Moves: 8-direction walk, 1-block step up (jump), drop of up to {@code MAX_DROP}.
+ */
+public final class AStar {
+    public static final int MAX_DROP = 3;
+    private static final double SQRT2 = 1.4142135623730951;
+    private static final double JUMP_COST = 1.6;
+
+    private static final int[][] DIRS = {
+        {1, 0}, {-1, 0}, {0, 1}, {0, -1},
+        {1, 1}, {1, -1}, {-1, 1}, {-1, -1}
+    };
+
+    public record Node(int x, int y, int z) {}
+
+    /** @param complete true when the path ends on a goal node; false = best-effort partial path. */
+    public record Result(List<Node> path, boolean complete) {}
+
+    private static final class Rec {
+        final Node node;
+        Rec parent;
+        double g;
+        boolean closed;
+
+        Rec(Node node) { this.node = node; }
+    }
+
+    /** Heap entry; immutable so improving a node never corrupts the heap order. */
+    private record Q(Rec rec, double f) implements Comparable<Q> {
+        @Override
+        public int compareTo(Q o) { return Double.compare(f, o.f); }
+    }
+
+    private AStar() {}
+
+    /**
+     * @param heuristic must not overestimate the remaining cost (0 is always safe)
+     * @param maxNodes  hard limit of expanded nodes; when hit, the best partial path is returned
+     * @return null when there is nowhere to go (start is boxed in and not a goal)
+     */
+    public static Result find(Terrain t, Node start, Predicate<Node> goal,
+                              ToDoubleFunction<Node> heuristic, int maxNodes) {
+        if (goal.test(start)) return new Result(List.of(start), true);
+
+        HashMap<Node, Rec> all = new HashMap<>();
+        PriorityQueue<Q> open = new PriorityQueue<>();
+
+        Rec s = new Rec(start);
+        s.g = 0;
+        double h0 = heuristic.applyAsDouble(start);
+        all.put(start, s);
+        open.add(new Q(s, h0));
+
+        Rec best = s;
+        double bestH = h0;
+        int expanded = 0;
+
+        while (!open.isEmpty() && expanded < maxNodes) {
+            Rec cur = open.poll().rec();
+            if (cur.closed) continue;
+            cur.closed = true;
+            expanded++;
+
+            if (goal.test(cur.node)) return new Result(build(cur), true);
+
+            double h = heuristic.applyAsDouble(cur.node);
+            if (h < bestH) { bestH = h; best = cur; }
+
+            expand(t, cur, all, open, heuristic);
+        }
+
+        if (best == s) return null;
+        return new Result(build(best), false);
+    }
+
+    private static void expand(Terrain t, Rec cur, HashMap<Node, Rec> all,
+                               PriorityQueue<Q> open, ToDoubleFunction<Node> heuristic) {
+        int x = cur.node.x, y = cur.node.y, z = cur.node.z;
+
+        for (int[] d : DIRS) {
+            int dx = d[0], dz = d[1];
+            int nx = x + dx, nz = z + dz;
+            boolean diag = dx != 0 && dz != 0;
+
+            if (diag) {
+                // both orthogonal neighbours must be free so we do not clip a corner
+                if (!t.isPassable(x + dx, y, z) || !t.isPassable(x + dx, y + 1, z)
+                    || !t.isPassable(x, y, z + dz) || !t.isPassable(x, y + 1, z + dz)) continue;
+            }
+
+            if (t.canStand(nx, y, nz)) {
+                relax(cur, new Node(nx, y, nz), diag ? SQRT2 : 1.0, all, open, heuristic);
+                continue;
+            }
+
+            if (diag) continue; // no diagonal jumps / drops
+
+            // step up one block
+            if (t.isPassable(x, y + 2, z) && t.canStand(nx, y + 1, nz)) {
+                relax(cur, new Node(nx, y + 1, nz), 1.0 + JUMP_COST, all, open, heuristic);
+                continue;
+            }
+
+            // walk off an edge and fall up to MAX_DROP blocks
+            if (t.isPassable(nx, y, nz) && t.isPassable(nx, y + 1, nz)) {
+                for (int k = 1; k <= MAX_DROP; k++) {
+                    if (!t.isPassable(nx, y - k, nz)) break;
+                    if (t.canStand(nx, y - k, nz)) {
+                        relax(cur, new Node(nx, y - k, nz), 1.0 + 0.6 * k, all, open, heuristic);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    private static void relax(Rec cur, Node next, double cost, HashMap<Node, Rec> all,
+                              PriorityQueue<Q> open, ToDoubleFunction<Node> heuristic) {
+        Rec r = all.get(next);
+        double g = cur.g + cost;
+        if (r == null) {
+            r = new Rec(next);
+            all.put(next, r);
+        } else if (r.closed || g >= r.g) {
+            return;
+        }
+        r.parent = cur;
+        r.g = g;
+        // lazy deletion: stale heap entries are skipped once the node is closed
+        open.add(new Q(r, g + heuristic.applyAsDouble(next)));
+    }
+
+    private static List<Node> build(Rec end) {
+        ArrayList<Node> out = new ArrayList<>();
+        for (Rec r = end; r != null; r = r.parent) out.add(r.node);
+        Collections.reverse(out);
+        return out;
+    }
+}
+=== FILE: src/main/java/com/example/autobuild/pathing/Navigator.java ===
+package com.example.autobuild.pathing;
+
+import com.example.autobuild.pathing.AStar.Node;
+import net.minecraft.client.MinecraftClient;
+import net.minecraft.client.network.ClientPlayerEntity;
+import net.minecraft.util.math.BlockPos;
+import net.minecraft.util.math.MathHelper;
+
+import java.util.List;
+import java.util.function.Predicate;
+import java.util.function.ToDoubleFunction;
+
+/**
+ * Walks the player along an A* path with no external pathfinder:
+ * turns the view towards the next node, holds forwardKey, jumps for step-ups,
+ * and re-plans when stuck or when the path runs out.
+ */
+public final class Navigator {
+    public enum State { IDLE, MOVING, ARRIVED, FAILED }
+
+    private final MinecraftClient mc = MinecraftClient.getInstance();
+
+    // tunables (set by the owning module)
+    public float turnSpeed = 35f;   // max degrees per tick
+    public boolean sprint = true;
+    public int maxNodes = 6000;
+
+    private Predicate<Node> goal;
+    private ToDoubleFunction<Node> heuristic;
+
+    private List<Node> path;
+    private int idx;
+    private int ticksSincePlan;
+    private int planFailures;
+
+    private double snapX, snapZ;
+    private int snapTicks;
+    private int stuckStrikes;
+
+    private State state = State.IDLE;
+
+    public State state() { return state; }
+
+    /** Start a new journey. {@code heuristic} must never overestimate the remaining distance. */
+    public void goTo(Predicate<Node> goal, ToDoubleFunction<Node> heuristic) {
+        this.goal = goal;
+        this.heuristic = heuristic;
+        this.path = null;
+        this.idx = 1;
+        this.planFailures = 0;
+        this.stuckStrikes = 0;
+        this.snapTicks = 0;
+        this.ticksSincePlan = 0;
+        this.state = State.MOVING;
+    }
+
+    public void stop() {
+        releaseKeys();
+        path = null;
+        goal = null;
+        state = State.IDLE;
+    }
+
+    /** Call once per tick. */
+    public State tick() {
+        ClientPlayerEntity p = mc.player;
+        if (p == null || mc.world == null) { stop(); return state; }
+        if (state != State.MOVING) { releaseKeys(); return state; }
+
+        Node here = new Node(p.getBlockX(), p.getBlockY(), p.getBlockZ());
+
+        if (goal.test(here) && p.isOnGround()) {
+            releaseKeys();
+            state = State.ARRIVED;
+            return state;
+        }
+
+        // stuck detection: less than 0.15 blocks of horizontal progress in 25 ticks
+        if (++snapTicks >= 25) {
+            double moved = Math.hypot(p.getX() - snapX, p.getZ() - snapZ);
+            snapX = p.getX(); snapZ = p.getZ(); snapTicks = 0;
+            if (moved < 0.15) {
+                if (++stuckStrikes >= 4) { fail(); return state; }
+                path = null; // force a re-plan
+            } else {
+                stuckStrikes = 0;
+            }
+        }
+
+        ticksSincePlan++;
+        if (path == null || idx >= path.size() || ticksSincePlan > 60) {
+            if (!plan(here)) { fail(); return state; }
+        }
+
+        // advance along the path
+        while (idx < path.size() && reached(p, path.get(idx))) idx++;
+        // if we got pushed further along the path, skip ahead
+        for (int j = Math.min(path.size() - 1, idx + 3); j > idx; j--) {
+            Node n = path.get(j);
+            if (n.x() == here.x() && n.z() == here.z() && Math.abs(n.y() - here.y()) <= 1) { idx = j + 1; break; }
+        }
+        if (idx >= path.size()) {
+            // end of this (possibly partial) path; re-plan next tick unless we arrived
+            releaseKeys();
+            path = null;
+            return state;
+        }
+
+        steer(p, path.get(idx));
+        return state;
+    }
+
+    private boolean plan(Node from) {
+        AStar.Result r = AStar.find(new WorldTerrain(mc.world), from, goal, heuristic, maxNodes);
+        ticksSincePlan = 0;
+        if (r == null || r.path().size() < 2 && !r.complete()) {
+            return ++planFailures < 3;
+        }
+        planFailures = r.complete() ? 0 : planFailures + 1;
+        if (planFailures >= 8) return false; // only ever getting partial progress
+        path = r.path();
+        idx = 1;
+        return true;
+    }
+
+    private boolean reached(ClientPlayerEntity p, Node n) {
+        double dx = p.getX() - (n.x() + 0.5);
+        double dz = p.getZ() - (n.z() + 0.5);
+        return dx * dx + dz * dz < 0.09 && Math.abs(p.getY() - n.y()) < 1.0;
+    }
+
+    private void steer(ClientPlayerEntity p, Node n) {
+        double dx = (n.x() + 0.5) - p.getX();
+        double dz = (n.z() + 0.5) - p.getZ();
+        double dist = Math.hypot(dx, dz);
+
+        // Minecraft yaw 0 faces +Z, -90 faces +X
+        float wanted = (float) (Math.toDegrees(Math.atan2(dz, dx)) - 90.0);
+        float diff = MathHelper.wrapDegrees(wanted - p.getYaw());
+        float step = MathHelper.clamp(diff, -turnSpeed, turnSpeed);
+        p.setYaw(p.getYaw() + step);
+        float remaining = Math.abs(MathHelper.wrapDegrees(wanted - p.getYaw()));
+
+        boolean forward = remaining < 50f;
+        boolean needStepUp = n.y() > p.getBlockY();
+        boolean jump = p.isOnGround() && forward
+            && (needStepUp && dist < 1.4 || p.horizontalCollision);
+
+        mc.options.forwardKey.setPressed(forward);
+        mc.options.sprintKey.setPressed(sprint && forward && remaining < 20f && dist > 1.5 && !needStepUp);
+        mc.options.jumpKey.setPressed(jump);
+        mc.options.backKey.setPressed(false);
+    }
+
+    private void fail() {
+        releaseKeys();
+        path = null;
+        state = State.FAILED;
+    }
+
+    private void releaseKeys() {
+        if (mc.options == null) return;
+        mc.options.forwardKey.setPressed(false);
+        mc.options.sprintKey.setPressed(false);
+        mc.options.jumpKey.setPressed(false);
+    }
+
+    /** Eye-distance helper shared by the builder: eye position of a player standing at node n. */
+    public static double eyeDistanceSq(Node n, BlockPos target) {
+        double dx = n.x() + 0.5 - (target.getX() + 0.5);
+        double dy = n.y() + 1.62 - (target.getY() + 0.5);
+        double dz = n.z() + 0.5 - (target.getZ() + 0.5);
+        return dx * dx + dy * dy + dz * dz;
+    }
+}
+=== FILE: src/main/java/com/example/autobuild/pathing/Terrain.java ===
+package com.example.autobuild.pathing;
+
+/**
+ * Abstract view of the world used by {@link AStar}. No Minecraft types here so
+ * the algorithm can be unit-tested with a plain Java grid.
+ */
+public interface Terrain {
+    /** True if the player's body can occupy this cell (no collision, no fluid, no hazard). */
+    boolean isPassable(int x, int y, int z);
+
+    /** True if the player can stand on top of this cell (full-height, non-hazard collision block). */
+    boolean isFloor(int x, int y, int z);
+
+    /** Feet at (x,y,z): feet and head cells free, floor below. */
+    default boolean canStand(int x, int y, int z) {
+        return isPassable(x, y, z) && isPassable(x, y + 1, z) && isFloor(x, y - 1, z);
+    }
+}
+=== FILE: src/main/java/com/example/autobuild/pathing/WorldTerrain.java ===
+package com.example.autobuild.pathing;
+
+import net.minecraft.block.Block;
+import net.minecraft.block.BlockState;
+import net.minecraft.block.Blocks;
+import net.minecraft.client.world.ClientWorld;
+import net.minecraft.util.math.BlockPos;
+import net.minecraft.util.math.Direction;
+import net.minecraft.util.shape.VoxelShape;
+
+import java.util.Set;
+
+/** {@link Terrain} backed by the client world (Yarn mappings, Minecraft 1.21.11). */
+public final class WorldTerrain implements Terrain {
+    private static final Set<Block> HAZARDS = Set.of(
+        Blocks.FIRE, Blocks.SOUL_FIRE, Blocks.CAMPFIRE, Blocks.SOUL_CAMPFIRE,
+        Blocks.MAGMA_BLOCK, Blocks.CACTUS, Blocks.SWEET_BERRY_BUSH, Blocks.WITHER_ROSE,
+        Blocks.COBWEB, Blocks.POWDER_SNOW, Blocks.POINTED_DRIPSTONE
+    );
+
+    private final ClientWorld world;
+    private final BlockPos.Mutable pos = new BlockPos.Mutable();
+
+    public WorldTerrain(ClientWorld world) {
+        this.world = world;
+    }
+
+    private boolean loaded(int x, int z) {
+        return world.getChunkManager().isChunkLoaded(x >> 4, z >> 4);
+    }
+
+    @Override
+    public boolean isPassable(int x, int y, int z) {
+        int top = world.getBottomY() + world.getHeight(); // first Y above the world
+        if (y >= top) return true;
+        if (y < world.getBottomY()) return false;
+        if (!loaded(x, z)) return false;
+
+        BlockState state = world.getBlockState(pos.set(x, y, z));
+        if (!state.getFluidState().isEmpty()) return false; // stay out of water and lava
+        if (HAZARDS.contains(state.getBlock())) return false;
+        return state.getCollisionShape(world, pos).isEmpty();
+    }
+
+    @Override
+    public boolean isFloor(int x, int y, int z) {
+        if (y < world.getBottomY() || y >= world.getBottomY() + world.getHeight()) return false;
+        if (!loaded(x, z)) return false;
+
+        BlockState state = world.getBlockState(pos.set(x, y, z));
+        if (HAZARDS.contains(state.getBlock())) return false;
+        if (!state.getFluidState().isEmpty() && state.getCollisionShape(world, pos).isEmpty()) return false;
+
+        VoxelShape shape = state.getCollisionShape(world, pos);
+        if (shape.isEmpty()) return false;
+        double top = shape.getMax(Direction.Axis.Y);
+        return top >= 0.999 && top <= 1.001; // full-height only (no slabs / fences / carpets)
+    }
+}
+=== FILE: src/main/resources/fabric.mod.json ===
+{
+  "schemaVersion": 1,
+  "id": "autobuild",
+  "version": "${version}",
+  "name": "Auto Build",
+  "description": "Mod riêng: tự xây công trình từ file .nbt, từng tầng một, có menu.",
+  "environment": "client",
+  "entrypoints": { "client": ["com.example.autobuild.AutoBuildClient"] },
+  "depends": {
+    "java": ">=21",
+    "minecraft": "~1.21.11",
+    "fabricloader": ">=0.18.4",
+    "fabric-api": "*"
+  }
+}
+=== FILE: src/main/resources/assets/autobuild/lang/en_us.json ===
+{
+  "key.autobuild.menu": "Open Auto Build menu",
+  "key.autobuild.toggle": "Start/Stop Auto Build",
+  "key.category.autobuild.main": "Auto Build"
+}
